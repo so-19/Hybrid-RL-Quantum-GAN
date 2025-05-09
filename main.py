@@ -17,7 +17,7 @@ device_shots = 8192
 batch_size = 64
 image_size = 28 
 latent_dim = 16
-n_epochs = 8
+n_epochs = 1
 critic_iterations = 5
 lambda_gp = 10
 lr_critic = 0.0001
@@ -393,11 +393,120 @@ def load_mnist_data():
     
     return train_loader
 
+class PatchCorrelationCounter:
+    def __init__(self, image_size, patch_size=7):
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.n_patches = (image_size // patch_size) ** 2
+        self.counter = np.zeros(self.n_patches)
+        self.patch_map = np.zeros((image_size, image_size), dtype=int)
+        self.boundary_values = {}
+        patch_idx = 0
+        for i in range(0, image_size, patch_size):
+            for j in range(0, image_size, patch_size):
+                if i + patch_size <= image_size and j + patch_size <= image_size:
+                    self.patch_map[i:i+patch_size, j:j+patch_size] = patch_idx
+                    patch_idx += 1
+    
+    def reset(self):
+        self.counter = np.zeros(self.n_patches)
+        self.boundary_values = {}
+    
+    def get_boundary_condition(self, patch_idx):
+        if patch_idx in self.boundary_values:
+            return self.boundary_values[patch_idx]
+        
+        counter_value = self.counter[patch_idx]
+        patch_row = patch_idx // (self.image_size // self.patch_size)
+        patch_col = patch_idx % (self.image_size // self.patch_size)        
+        boundary_condition = np.zeros(4)# [top, right, bottom, left]
+        boundary_condition[:] = np.tanh(counter_value) * 0.5
+        
+        return boundary_condition
+    
+    def update_counter(self, patch_idx, patch_pixels):
+        patch_2d = patch_pixels.view(self.patch_size, self.patch_size).detach()
+        top_edge = patch_2d[0, :].mean().item()
+        right_edge = patch_2d[:, -1].mean().item()
+        bottom_edge = patch_2d[-1, :].mean().item()
+        left_edge = patch_2d[:, 0].mean().item()
+        
+        boundary_values = np.array([top_edge, right_edge, bottom_edge, left_edge])
+        self.boundary_values[patch_idx] = boundary_values        
+        self.counter[patch_idx] = np.mean(boundary_values) * 2.0
+        
+        patch_row = patch_idx // (self.image_size // self.patch_size)
+        patch_col = patch_idx % (self.image_size // self.patch_size)
+        patches_per_row = self.image_size // self.patch_size        
+        if patch_row > 0:
+            top_neighbor = (patch_row - 1) * patches_per_row + patch_col
+            self.counter[top_neighbor] = (self.counter[top_neighbor] + top_edge) / 2
+            
+        # Right neighbor
+        if patch_col < patches_per_row - 1:
+            right_neighbor = patch_row * patches_per_row + patch_col + 1
+            self.counter[right_neighbor] = (self.counter[right_neighbor] + right_edge) / 2
+            
+        # Bottom neighbor
+        if patch_row < patches_per_row - 1:
+            bottom_neighbor = (patch_row + 1) * patches_per_row + patch_col
+            self.counter[bottom_neighbor] = (self.counter[bottom_neighbor] + bottom_edge) / 2
+            
+        # Left neighbor
+        if patch_col > 0:
+            left_neighbor = patch_row * patches_per_row + patch_col - 1
+            self.counter[left_neighbor] = (self.counter[left_neighbor] + left_edge) / 2
+    
+    def stitch_patches(self, patch_tensors):
+        patches_per_side = self.image_size // self.patch_size
+        full_image = torch.zeros(self.image_size, self.image_size)
+        for i in range(patches_per_side):
+            for j in range(patches_per_side):
+                patch_idx = i * patches_per_side + j
+                if patch_idx < len(patch_tensors):
+                    start_i = i * self.patch_size
+                    start_j = j * self.patch_size
+                    patch = patch_tensors[patch_idx].view(self.patch_size, self.patch_size)
+                    full_image[start_i:start_i+self.patch_size, start_j:start_j+self.patch_size] = patch
+        
+        return full_image
+
+def quantum_generator_with_patches(quantum_generator, generator_params, latent_dim, n_patches, patch_correlation_counter):
+    patch_tensors = []
+    for i in range(n_patches):
+        latent_vector = torch.randn(latent_dim) * 0.05
+        boundary_condition = patch_correlation_counter.get_boundary_condition(i)
+        latent_vector_np = latent_vector.detach().numpy()
+        if len(latent_vector_np) >= 4:
+            latent_vector_np[:4] = latent_vector_np[:4] * 0.5 + boundary_condition
+        
+        try:
+            params_np = generator_params.detach().numpy()
+            quantum_output = quantum_generator(latent_vector_np, params_np)
+            patch_tensor = torch.tensor(quantum_output, dtype=torch.float32)
+            patch_size = patch_correlation_counter.patch_size
+            patch_pixels = quantum_generator_output_to_image(patch_tensor, patch_size)
+            patch_correlation_counter.update_counter(i, patch_pixels)
+            patch_tensors.append(patch_pixels)
+        except Exception as e:
+            print(f"Error generating patch {i}: {str(e)}")
+            patch_size = patch_correlation_counter.patch_size
+            patch_pixels = torch.rand(patch_size * patch_size)
+            patch_correlation_counter.update_counter(i, patch_pixels)
+            patch_tensors.append(patch_pixels)
+    
+    full_image = patch_correlation_counter.stitch_patches(patch_tensors)
+    return full_image
+
 def train_quantum_gan(quantum_generator, n_params, train_loader):
     critic = ClassicalCritic(image_size * image_size)
     generator_params = nn.Parameter(torch.zeros(n_params) + 0.01)
     critic_optimizer = optim.Adam(critic.parameters(), lr=lr_critic)
     generator_optimizer = optim.Adam([generator_params], lr=lr_generator)
+    patch_size = 7  # Each patch will be 7x7
+    n_patches = (image_size // patch_size) ** 2
+    patch_correlation_counter = PatchCorrelationCounter(image_size, patch_size)
+    
     def fallback_generator(batch_size):
         return torch.rand(batch_size, num_qubits) * 2 - 1
     
@@ -410,37 +519,25 @@ def train_quantum_gan(quantum_generator, n_params, train_loader):
             # Training Critic
             for _ in range(critic_iterations):
                 critic_optimizer.zero_grad()
-                # Generate small latent vectors
-                latent_vectors = torch.randn(quantum_batch_size, latent_dim) * 0.05
-                latent_vectors_np = latent_vectors.detach().numpy()
-                max_retries = 3
-                fake_quantum_outputs = None
                 
-                for retry in range(max_retries):
-                    try:
-                        output_list = []
-                        for i in range(quantum_batch_size):
-                            params_np = generator_params.detach().clone().numpy()
-                            quantum_output = quantum_generator(latent_vectors_np[i], params_np)
-                            output_list.append(torch.tensor(quantum_output))
-                        
-                        fake_quantum_outputs = torch.stack(output_list)
-                        break 
-                    
-                    except Exception as e:
-                        print(f"Retry {retry+1}/{max_retries}: {str(e)}")
-                        if retry == max_retries - 1:  # Last retry
-                            print("Using fallback generator")
-                            fake_quantum_outputs = fallback_generator(quantum_batch_size)
+                fake_imgs = []
+                for i in range(quantum_batch_size):
+                    patch_correlation_counter.reset()
+                    fake_img = quantum_generator_with_patches(
+                        quantum_generator, 
+                        generator_params, 
+                        latent_dim, 
+                        n_patches, 
+                        patch_correlation_counter
+                    )
+                    fake_imgs.append(fake_img.flatten())
                 
-
-                if fake_quantum_outputs.size(0) < real_batch_size:
-                    repeat_factor = (real_batch_size + fake_quantum_outputs.size(0) - 1) // fake_quantum_outputs.size(0)
-                    fake_quantum_outputs = fake_quantum_outputs.repeat(repeat_factor, 1)
-                    fake_quantum_outputs = fake_quantum_outputs[:real_batch_size]
+                fake_imgs = torch.stack(fake_imgs)
                 
-                fake_imgs = torch.stack([quantum_generator_output_to_image(output, image_size) 
-                                       for output in fake_quantum_outputs])
+                if fake_imgs.size(0) < real_batch_size:
+                    repeat_factor = (real_batch_size + fake_imgs.size(0) - 1) // fake_imgs.size(0)
+                    fake_imgs = fake_imgs.repeat(repeat_factor, 1)
+                    fake_imgs = fake_imgs[:real_batch_size]
                 
                 real_validity = critic(real_imgs)
                 fake_validity = critic(fake_imgs)                
@@ -452,45 +549,33 @@ def train_quantum_gan(quantum_generator, n_params, train_loader):
                 critic_optimizer.step()
             
             generator_optimizer.zero_grad()
-            max_retries = 3
-            fake_quantum_outputs = None
             
-            for retry in range(max_retries):
-                try:
-                    # Generate new latent vectors
-                    latent_vectors = torch.randn(quantum_batch_size, latent_dim) * 0.05
-                    latent_vectors_np = latent_vectors.detach().numpy()
-                    # Generate fake images
-                    output_list = []
-                    for i in range(quantum_batch_size):
-                        params_np = generator_params.detach().clone().numpy()
-                        quantum_output = quantum_generator(latent_vectors_np[i], params_np)
-                        output_tensor = torch.tensor(quantum_output, dtype=torch.float32)
-                        output_list.append(output_tensor)
-                    
-                    fake_quantum_outputs = torch.stack(output_list)
-                    break
-                
-                except Exception as e:
-                    print(f"Generator retry {retry+1}/{max_retries}: {str(e)}")
-                    if retry == max_retries - 1:  # Last retry
-                        print("Using fallback generator for generator training")
-                        fake_quantum_outputs = fallback_generator(quantum_batch_size)
+            fake_imgs = []
+            for i in range(quantum_batch_size):
+                patch_correlation_counter.reset()
+                fake_img = quantum_generator_with_patches(
+                    quantum_generator, 
+                    generator_params, 
+                    latent_dim, 
+                    n_patches, 
+                    patch_correlation_counter
+                )
+                fake_imgs.append(fake_img.flatten())
             
-            if fake_quantum_outputs.size(0) < real_batch_size:
-                repeat_factor = (real_batch_size + fake_quantum_outputs.size(0) - 1) // fake_quantum_outputs.size(0)
-                fake_quantum_outputs = fake_quantum_outputs.repeat(repeat_factor, 1)
-                fake_quantum_outputs = fake_quantum_outputs[:real_batch_size]
+            fake_imgs = torch.stack(fake_imgs)
             
-            fake_imgs = torch.stack([quantum_generator_output_to_image(output, image_size) 
-                                   for output in fake_quantum_outputs])
+            if fake_imgs.size(0) < real_batch_size:
+                repeat_factor = (real_batch_size + fake_imgs.size(0) - 1) // fake_imgs.size(0)
+                fake_imgs = fake_imgs.repeat(repeat_factor, 1)
+                fake_imgs = fake_imgs[:real_batch_size]
             
             fake_validity = critic(fake_imgs)
             generator_loss = -torch.mean(fake_validity)
             
-            if not isinstance(fake_quantum_outputs, torch.Tensor) or torch.isnan(generator_loss):
-                print("Skipping generator backpropagation due to NaN loss or fallback generator")
+            if torch.isnan(generator_loss):
+                print("Skipping generator backpropagation due to NaN loss")
                 continue
+            
             # Compute additional metrics for RL feedback
             try:
                 inception_score = compute_inception_score(fake_imgs)
@@ -506,12 +591,21 @@ def train_quantum_gan(quantum_generator, n_params, train_loader):
                 print(f"[Epoch {epoch}/{n_epochs}] [Batch {batch_idx}/{len(train_loader)}] "
                       f"[Critic loss: {critic_loss.item():.4f}] [Generator loss: {generator_loss.item():.4f}]")
                 
-                # Periodically save am image
+                # Periodically save an image
                 if batch_idx % 50 == 0:
                     try:
                         plt.figure(figsize=(5, 5))
                         plt.imshow(fake_imgs[0].view(image_size, image_size).detach().numpy(), cmap='gray')
                         plt.savefig(f'sample_epoch{epoch}_batch{batch_idx}.png')
+                        plt.close()
+                        
+                        plt.figure(figsize=(5, 5))
+                        img_with_boundaries = fake_imgs[0].view(image_size, image_size).detach().numpy()
+                        for i in range(0, image_size, patch_size):
+                            img_with_boundaries[i, :] = 1.0
+                            img_with_boundaries[:, i] = 1.0
+                        plt.imshow(img_with_boundaries, cmap='gray')
+                        plt.savefig(f'sample_with_boundaries_epoch{epoch}_batch{batch_idx}.png')
                         plt.close()
                     except Exception as e:
                         print(f"Error saving sample image: {str(e)}")
