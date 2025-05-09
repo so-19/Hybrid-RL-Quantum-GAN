@@ -17,7 +17,7 @@ device_shots = 8192
 batch_size = 64
 image_size = 28 
 latent_dim = 16
-n_epochs = 1
+n_epochs = 8
 critic_iterations = 5
 lambda_gp = 10
 lr_critic = 0.0001
@@ -68,7 +68,6 @@ class CircuitDesignState:
         self.qubit_usage = np.zeros(num_qubits)
         
     def to_vector(self):
-        """Convert the state to a feature vector for the RL agent"""
         features = []
         features.append(self.current_layer / self.max_layers)        
         gate_counts = np.zeros(len(GATE_OPTIONS))
@@ -95,11 +94,11 @@ class CircuitDesignState:
                     self.connectivity_matrix[control_qubit, target_qubit] += 1
                     self.qubit_usage[control_qubit] += 1
                     self.qubit_usage[target_qubit] += 1
-                    self.parameters.append(None)  # No parameter for CNOT
+                    self.parameters.append(None) # No parameter for CNOT
             else:
                 self.gates[self.current_layer].append((gate_type, target_qubit))
                 self.qubit_usage[target_qubit] += 1
-                self.parameters.append(None)  # Placeholder, will be optimized during training
+                self.parameters.append(None) # Placeholder, will be optimized during training
                 
     def next_layer(self):
         if self.current_layer < self.max_layers:
@@ -108,7 +107,6 @@ class CircuitDesignState:
         return False
 
 class CircuitDesignAgent(nn.Module):
-    """Reinforcement learning agent for quantum circuit design"""
     def __init__(self, state_dim, action_dim):
         super(CircuitDesignAgent, self).__init__()
         
@@ -158,7 +156,6 @@ def action_to_gate_and_qubits(action, num_qubits):
     total_options = len(GATE_OPTIONS) * num_qubits * (num_qubits + 1)
     if action >= total_options:
         action = total_options - 1
-    
     gate_type = action % len(GATE_OPTIONS)
     remaining = action // len(GATE_OPTIONS)
     target_qubit = remaining % num_qubits
@@ -179,7 +176,7 @@ def dynamic_quantum_generator(latent_vector, circuit_design, params):
     
     param_idx = 0
     for layer_idx, layer in enumerate(circuit_design.gates):
-        if not layer:  # Skip empty layers
+        if not layer: # Skip empty layers
             continue
             
         for gate in layer:
